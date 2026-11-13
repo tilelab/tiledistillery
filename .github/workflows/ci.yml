@@ -1,0 +1,26 @@
+name: CI self-test
+
+# Runs the whole pipeline on two layers built together, a dummy one and the
+# tutorial's, scoped to three microstates in two shards. Also the smallest
+# caller.
+
+# Also called by release.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build-dummy-layers:
+    uses: ./.github/workflows/_pipeline.yml
+    permissions:
+      contents: read
+    with:
+      config: dummy/config.json,docs/tutorials/tiles/config.json
+      process: dummy/process.lua,docs/tutorials/tiles/process.lua
+      layer: ci-dummy-place,ci-tutorial-bins
+      attribution: "tiledistillery CI self-test, data (c) OpenStreetMap contributors, ODbL"
+      shards: "2"
+      regions: "europe/monaco,europe/liechtenstein,europe/andorra"

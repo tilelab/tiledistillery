@@ -1,0 +1,31 @@
+[project]
+name = "tiledistillery"
+version = "1.0.0"
+description = "Builds vector-tile layers from OSM extracts with tilemaker, split across workers and merged."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = ["requests"]
+
+[project.urls]
+Repository = "https://github.com/tilelab/tiledistillery"
+
+[project.scripts]
+tiledistillery = "tiledistillery.cli:main"
+
+# Declared the way plugins declare theirs; see docs/reference/sources.md.
+[project.entry-points."tiledistillery.sources"]
+geofabrik = "tiledistillery.sources.geofabrik:GeofabrikSource"
+
+[build-system]
+# >=77 for the SPDX `license` string.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tiledistillery*"]
+
+[tool.mypy]
+strict = true
+files = ["tiledistillery"]

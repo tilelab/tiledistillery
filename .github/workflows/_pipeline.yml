@@ -1,0 +1,220 @@
+name: tiledistillery pipeline (reusable)
+
+# Builds layers with the caller's tilemaker configs, one job per
+# `tiledistillery` step:
+#
+#   plan   splits the regions in scope into shards: writes plan/.
+#   work   one job per shard: writes parts/N/.
+#   merge  one job per layer: the <layer>-pmtiles artifact.
+#
+# Called with
+# `uses: tilelab/tiledistillery/.github/workflows/_pipeline.yml@<ref>` from
+# the repository holding the configs. Publishes nothing; that is the
+# caller's job. See docs/reference/workflows.md.
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: "Path of the tilemaker JSON config in the calling repository, or a comma-separated list, one per layer."
+        required: true
+        type: string
+      process:
+        description: "Path of the tilemaker Lua process script, or a comma-separated list, one per layer."
+        required: true
+        type: string
+      layer:
+        description: 'Layer name, or a comma-separated list, such as "bins,roads".'
+        required: true
+        type: string
+      attribution:
+        description: "Attribution written into every layer's metadata."
+        required: true
+        type: string
+      shards:
+        description: "Number of shards, one worker job each. 20 fills GitHub Free's concurrent jobs."
+        required: false
+        type: string
+        default: "20"
+      regions:
+        description: 'Comma-separated region ids, each with every region below it, such as "europe" or "europe/monaco,europe/andorra". Empty builds the world.'
+        required: false
+        type: string
+        default: ""
+
+# Log templates make warnings annotations and fold each region's log; see
+# docs/reference/cli.md "Log output".
+env:
+  TILEDISTILLERY_LOG_WARNING: "::warning title={title}::{message}"
+  TILEDISTILLERY_LOG_GROUP: "::group::{title}"
+  TILEDISTILLERY_LOG_END_GROUP: "::endgroup::"
+
+# Every job checks tiledistillery out into .tiledistillery/ at its own
+# commit and runs .github/actions/setup from there. The caller is checked
+# out at the root, the working directory tilemaker sees.
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    # Read from plan.json, the only source of the shard count and layers.
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      layers: ${{ steps.plan.outputs.layers }}
+    steps:
+      # Empty on GitHub Enterprise Server, where checkout would silently fall
+      # back to the default branch.
+      - name: Validate the tiledistillery checkout resolves
+        if: ${{ !job.workflow_repository || !job.workflow_sha }}
+        run: |
+          echo "::error::job.workflow_repository/job.workflow_sha are empty (they are not available on GitHub Enterprise Server), so the tiledistillery checkouts below can't be resolved"
+          exit 1
+
+      # First, as it empties the root. plan checks the configs exist.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
+      - uses: ./.tiledistillery/.github/actions/setup
+
+      - id: plan
+        name: Split the regions into shards
+        env:
+          CONFIG: ${{ inputs.config }}
+          PROCESS: ${{ inputs.process }}
+          LAYER: ${{ inputs.layer }}
+          ATTRIBUTION: ${{ inputs.attribution }}
+          SHARDS: ${{ inputs.shards }}
+          REGIONS: ${{ inputs.regions }}
+        run: |
+          tiledistillery plan --config "$CONFIG" --process "$PROCESS" \
+            --layer "$LAYER" --attribution "$ATTRIBUTION" \
+            --shards "$SHARDS" --regions "$REGIONS"
+          jq -r '"shards=\([range(.shards | length)] | tojson)",
+                 "layers=\([.layers[].name] | tojson)"' \
+            plan/plan.json >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plan
+          path: plan/
+
+  # A failed job doesn't cancel the others; "Re-run failed jobs" builds
+  # only its shard again.
+  work:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shards) }}
+    steps:
+      # First, as it empties the root. tilemaker reads the configs from it.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
+      - uses: ./.tiledistillery/.github/actions/setup
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: plan
+          path: plan
+
+      - name: Build this shard's regions
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: tiledistillery work --shard "$SHARD"
+
+      # Rooted at parts/, so merges get every parts/N/ side by side.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: parts-${{ matrix.shard }}
+          path: parts/
+
+  merge:
+    needs: [plan, work]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        layer: ${{ fromJson(needs.plan.outputs.layers) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
+      - uses: ./.tiledistillery/.github/actions/setup
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: plan
+          path: plan
+
+      # Every layer's tiles; the merge picks its own by directory.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: parts-*
+          path: parts
+          merge-multiple: true
+
+      # apt mirrors have hung for 20+ minutes, so the binary is cached,
+      # under a key that changes monthly.
+      - name: Cache key date
+        id: cache-date
+        run: echo "date=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached tile-join
+        id: tippecanoe-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/tippecanoe-bin
+          key: tippecanoe-bin-${{ runner.os }}-${{ steps.cache-date.outputs.date }}
+          restore-keys: |
+            tippecanoe-bin-${{ runner.os }}-
+
+      # Bounded, falling back to a source build.
+      - name: Install tippecanoe
+        if: steps.tippecanoe-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update \
+            && sudo apt-get install -y tippecanoe || {
+            git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe
+            make -C /tmp/tippecanoe -j"$(nproc)"
+            sudo make -C /tmp/tippecanoe install
+          }
+          mkdir -p ~/.cache/tippecanoe-bin
+          cp "$(command -v tile-join)" ~/.cache/tippecanoe-bin/
+
+      - name: Add tile-join to PATH
+        run: echo "$HOME/.cache/tippecanoe-bin" >> "$GITHUB_PATH"
+
+      - name: Merge this layer
+        env:
+          LAYER: ${{ matrix.layer }}
+        run: tiledistillery merge --layer "$LAYER"
+
+      - name: Summarize
+        env:
+          LAYER: ${{ matrix.layer }}
+        run: |
+          echo "### ${LAYER}: $(du -h "layers/${LAYER}.pmtiles" | cut -f1)" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.layer }}-pmtiles
+          path: layers/${{ matrix.layer }}.pmtiles

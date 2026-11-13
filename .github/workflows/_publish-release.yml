@@ -1,0 +1,112 @@
+name: Publish a GitHub Release (reusable)
+
+# Publishes a _pipeline.yml layer artifact as a fixed-tag GitHub Release of
+# the calling repository, split into parts if needed. It uses only the
+# caller's own token, so it is safe to call from any repository.
+
+on:
+  workflow_call:
+    inputs:
+      layer:
+        description: 'The layer, e.g. "bins" for the "bins-pmtiles" artifact holding bins.pmtiles.'
+        required: true
+        type: string
+      tag:
+        description: 'Fixed release tag, replaced on every run, e.g. "bins-latest".'
+        required: true
+        type: string
+      title:
+        description: 'Release title, e.g. "Waste baskets".'
+        required: true
+        type: string
+
+jobs:
+  publish-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the merged layer
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.layer }}-pmtiles
+
+      - name: Split into release-sized parts if needed
+        id: split
+        env:
+          LAYER: ${{ inputs.layer }}
+        run: |
+          FILE="${LAYER}.pmtiles"
+          LIMIT_BYTES=$((2000 * 1024 * 1024))
+          SIZE_BYTES=$(stat -c%s "$FILE")
+          if [ "$SIZE_BYTES" -gt "$LIMIT_BYTES" ]; then
+            split -b 2000M -d -a 3 "$FILE" "${FILE}.part"
+            echo "split=true" >> "$GITHUB_OUTPUT"
+            ls "${FILE}.part"* > release-assets.txt
+          else
+            echo "split=false" >> "$GITHUB_OUTPUT"
+            echo "$FILE" > release-assets.txt
+          fi
+
+      # Uploads into a draft, each asset retried and checked, so the old
+      # release stays until the new one is complete.
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LAYER: ${{ inputs.layer }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+        run: |
+          FILE="${LAYER}.pmtiles"
+          DRAFT="${TAG}-draft"
+          DL_CMD="gh release download $TAG --repo $REPO"
+          if [ "${{ steps.split.outputs.split }}" = "true" ]; then
+            UNIX_CMD="$DL_CMD && cat ${FILE}.part* > $FILE"
+            WIN_CMD="$DL_CMD && copy /b ${FILE}.part* $FILE"
+          else
+            UNIX_CMD="$DL_CMD"
+            WIN_CMD="$DL_CMD"
+          fi
+          printf '%s\n' \
+            "${TITLE}." \
+            "Built $(date -u +%Y-%m-%d) (run #${{ github.run_number }})." \
+            "" \
+            "Download (requires the [GitHub CLI](https://cli.github.com/), \`gh\`):" \
+            "" \
+            '**macOS / Linux:**' \
+            '```' \
+            "$UNIX_CMD" \
+            '```' \
+            "" \
+            '**Windows (cmd.exe):**' \
+            '```' \
+            "$WIN_CMD" \
+            '```' \
+            > release-notes.md
+          # Left over from a failed run, if any.
+          gh release delete "$DRAFT" --repo "$REPO" --yes || true
+          gh release create "$DRAFT" --repo "$REPO" --draft \
+            --title "$TITLE" --notes-file release-notes.md
+          mapfile -t ASSETS < release-assets.txt
+          for ASSET in "${ASSETS[@]}"; do
+            EXPECTED="$(stat -c%s "$ASSET") uploaded"
+            for ATTEMPT in 1 2 3; do
+              if gh release upload "$DRAFT" "$ASSET" --repo "$REPO" --clobber; then
+                ACTUAL=$(gh release view "$DRAFT" --repo "$REPO" --json assets \
+                  --jq ".assets[] | select(.name == \"$ASSET\") | \"\\(.size) \\(.state)\"") || true
+                [ "$ACTUAL" = "$EXPECTED" ] && break
+                echo "::warning::$ASSET is \"$ACTUAL\" on the draft, not \"$EXPECTED\""
+              fi
+              if [ "$ATTEMPT" = 3 ]; then
+                echo "::error::$ASSET didn't upload in 3 attempts; $TAG is unchanged"
+                exit 1
+              fi
+              echo "::warning::uploading $ASSET again in a minute, attempt $((ATTEMPT + 1)) of 3"
+              sleep 60
+            done
+          done
+          # Replaces the last release and its tag; there is none on the
+          # first run.
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag || true
+          gh release edit "$DRAFT" --repo "$REPO" --tag "$TAG" --draft=false

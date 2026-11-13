@@ -1,0 +1,15 @@
+{
+  "layers": {
+    "bins": { "minzoom": 10, "maxzoom": 14 }
+  },
+  "settings": {
+    "minzoom": 10,
+    "maxzoom": 14,
+    "basezoom": 14,
+    "include_ids": false,
+    "name": "Waste baskets",
+    "version": "1.0",
+    "description": "Public waste baskets from OpenStreetMap",
+    "compress": "gzip"
+  }
+}

@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+build/
+dist/
+*.egg-info/
+.venv/
+
+# macOS
+.DS_Store
+
+# Run directory, from trying the steps here
+/plan/
+/extracts/
+/parts/
+/layers/
